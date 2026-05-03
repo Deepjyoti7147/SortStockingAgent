@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  sorting-agent:
+    build: .
+    image: sorting-agent:latest
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    env_file: .env
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

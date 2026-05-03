@@ -1,0 +1,60 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.SERVER_IP }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Write .env and Deploy
+        env:
+          S_USER: ${{ secrets.SERVER_USER || secrets.USERNAME }}
+          S_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          DEST="$S_IP"
+          if [ -n "$S_USER" ]; then DEST="${S_USER}@${S_IP}"; fi
+          
+          ssh -i ~/.ssh/id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o ServerAliveInterval=60 \
+              -o ServerAliveCountMax=10 \
+              "$DEST" 'bash -s' << 'ENDSSH'
+            set -euo pipefail
+            APP_DIR="/opt/sorting-agent"
+            
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R "$USER:$USER" "$APP_DIR"
+            
+            # Write .env
+            echo "POSTGRES_HOST=${{ secrets.POSTGRES_HOST }}" > "$APP_DIR/.env"
+            echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}" >> "$APP_DIR/.env"
+            echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}" >> "$APP_DIR/.env"
+            echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" >> "$APP_DIR/.env"
+            echo "API_BASE_URL=${{ secrets.API_BASE_URL }}" >> "$APP_DIR/.env"
+
+            # Sync Code
+            if [ ! -d "$APP_DIR/.git" ]; then
+              cd "$APP_DIR"
+              git init
+              git remote add origin https://github.com/Deepjyoti7147/SortStockingAgent.git
+            fi
+            
+            cd "$APP_DIR"
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # Build and Restart
+            sudo docker compose build --no-cache
+            sudo docker compose down || true
+            sudo docker compose up -d
+          ENDSSH
