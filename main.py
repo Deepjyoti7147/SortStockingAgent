@@ -171,7 +171,7 @@ def run_agent():
         
         for symbol in symbols:
             process_symbol(symbol, conn)
-            time.sleep(1) # Be gentle on the API and DB
+            time.sleep(5) # 5 second delay to strictly rate limit API and DB calls
             
         print("Scoring run complete!")
         last_run_time = datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
