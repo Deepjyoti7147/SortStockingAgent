@@ -76,50 +76,84 @@ def calculate_rsi(series, period=14):
 API_TIMEOUT = 10  # seconds per fundamentals request
 
 
-def fetch_sentiment_score(symbol: str, company_name: str, conn) -> float:
+def fetch_sentiment_score(symbol: str, company_name: str, sector: str, conn) -> float:
     """
-    Phase 1: Query the last 7 days of news_analysis for this symbol.
-    - Query 1: Matches on impact_entity using company_name (e.g. 'Reliance Industries')
-               so the comparison against LLM-extracted entity names is accurate.
-    - Query 2: Matches on yf_news.symbol (exact ticker) — always precise.
-    Returns a score 0-100: 50 = neutral, >50 positive, <50 negative.
+    Query last 7 days of news_analysis. Three sources, weighted by specificity:
+      Query 1 (company RSS)  — impact_level='Company', matched by company_name  → weight 60%
+      Query 2 (yf_news)      — matched by exact ticker symbol                   → weight 60% (combined with Q1)
+      Query 3 (sector RSS)   — impact_level='Sector',  matched by sector name   → weight 40%
+    Final score: company_score * 0.6 + sector_score * 0.4
+    Returns 0-100 (50 = neutral).
     """
+    def _sentiment_score(pos, neg, total):
+        if total == 0:
+            return None  # no data
+        return round(min(max(((pos - neg) / total) * 50 + 50, 0), 100), 2)
+
     try:
         with conn.cursor() as cur:
-            # Query 1: RSS news — match company name against LLM-extracted impact_entity
+            # Query 1: RSS news matched by company name
             cur.execute("""
                 SELECT
-                    SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END) AS pos,
-                    SUM(CASE WHEN na.sentiment = 'Negative' THEN 1 ELSE 0 END) AS neg,
-                    COUNT(*) AS total
-                FROM news_analysis na
-                WHERE na.impact_level = 'Company'
-                  AND UPPER(na.impact_entity) = UPPER(%s)
-                  AND na.created_at > NOW() - INTERVAL '7 days'
+                    SUM(CASE WHEN sentiment = 'Positive' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN sentiment = 'Negative' THEN 1 ELSE 0 END),
+                    COUNT(*)
+                FROM news_analysis
+                WHERE impact_level = 'Company'
+                  AND UPPER(impact_entity) = UPPER(%s)
+                  AND created_at > NOW() - INTERVAL '7 days'
             """, (company_name,))
-            row = cur.fetchone()
-            pos, neg, total = (row[0] or 0), (row[1] or 0), (row[2] or 0)
+            r = cur.fetchone()
+            c_pos, c_neg, c_total = (r[0] or 0), (r[1] or 0), (r[2] or 0)
 
-            # Query 2: yfinance news — match exact ticker symbol (always correct)
+            # Query 2: yfinance news matched by exact ticker symbol
             cur.execute("""
                 SELECT
-                    SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END) AS pos,
-                    SUM(CASE WHEN na.sentiment = 'Negative' THEN 1 ELSE 0 END) AS neg,
-                    COUNT(*) AS total
+                    SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN na.sentiment = 'Negative' THEN 1 ELSE 0 END),
+                    COUNT(*)
                 FROM yf_news yf
                 JOIN news_analysis na ON yf.id = na.article_id AND na.article_source = 'yf'
                 WHERE UPPER(yf.symbol) = UPPER(%s)
                   AND yf.fetched_at > NOW() - INTERVAL '7 days'
             """, (symbol,))
-            row2 = cur.fetchone()
-            pos   += (row2[0] or 0)
-            neg   += (row2[1] or 0)
-            total += (row2[2] or 0)
+            r2 = cur.fetchone()
+            c_pos   += (r2[0] or 0)
+            c_neg   += (r2[1] or 0)
+            c_total += (r2[2] or 0)
 
-        if total == 0:
-            return 50.0  # neutral when no data
-        score = ((pos - neg) / total) * 50 + 50
-        return round(min(max(score, 0), 100), 2)
+            # Query 3: Sector-level RSS news
+            s_pos = s_neg = s_total = 0
+            if sector:
+                cur.execute("""
+                    SELECT
+                        SUM(CASE WHEN sentiment = 'Positive' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN sentiment = 'Negative' THEN 1 ELSE 0 END),
+                        COUNT(*)
+                    FROM news_analysis
+                    WHERE impact_level = 'Sector'
+                      AND UPPER(impact_entity) = UPPER(%s)
+                      AND created_at > NOW() - INTERVAL '7 days'
+                """, (sector,))
+                r3 = cur.fetchone()
+                s_pos, s_neg, s_total = (r3[0] or 0), (r3[1] or 0), (r3[2] or 0)
+
+        company_score = _sentiment_score(c_pos, c_neg, c_total)
+        sector_score  = _sentiment_score(s_pos, s_neg, s_total)
+
+        # Blend: use what's available
+        if company_score is not None and sector_score is not None:
+            final = company_score * 0.6 + sector_score * 0.4
+        elif company_score is not None:
+            final = company_score
+        elif sector_score is not None:
+            final = sector_score
+        else:
+            final = 50.0  # no data at all — neutral
+
+        print(f"[{symbol}] Sentiment — company: {company_score} ({c_total} articles) | "
+              f"sector '{sector}': {sector_score} ({s_total} articles) | blended: {final:.1f}")
+        return round(final, 2)
     except Exception as e:
         print(f"[{symbol}] Sentiment query failed: {e}")
         return 50.0
@@ -154,9 +188,10 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
     company_name = (
         profile.get('longName')
         or profile.get('shortName')
-        or symbol  # last resort fallback to ticker
+        or symbol
     )
-    print(f"[{symbol}] Company name resolved to: '{company_name}'")
+    sector = profile.get('sector', '')  # e.g. 'Information Technology', 'Banking'
+    print(f"[{symbol}] Resolved → company: '{company_name}' | sector: '{sector}'")
     
     query = """
         SELECT timestamp, COALESCE(close, adj_close) AS close, volume 
@@ -199,8 +234,8 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
         print(f"[{symbol}] Could not fetch trailingPe from yahooquery: {e}")
         pe_ratio = 0
 
-    # ── Phase 1: Sentiment score ───────────────────────────────────────────────
-    sentiment_score = fetch_sentiment_score(symbol, company_name, conn)
+    # ── Phase 1: Sentiment score (company + sector) ───────────────────────────
+    sentiment_score = fetch_sentiment_score(symbol, company_name, sector, conn)
 
     # ── Phase 2: Additional fundamentals (ROE, Debt/Equity, Revenue Growth) ──
     balance_sheet = fundamentals.get('balance_sheet', {})
