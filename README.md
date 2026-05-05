@@ -1,64 +1,131 @@
 # 📈 SortStockingAgent (Sorting Agent)
 
-The Sorting Agent is a scheduled background service designed to compute composite financial scores (0-100) for Indian stocks. It pulls historical End-of-Day (EOD) price data directly from your PostgreSQL database and fetches fundamental data (Balance Sheet, Cash Flow, Profile) dynamically from the `StockmarketDataCollector` API.
+The Sorting Agent is a scheduled background service that computes composite financial scores (0–100) for Indian stocks. It pulls historical End-of-Day (EOD) price data from PostgreSQL, fetches fundamentals from the `StockmarketDataCollector` API, enriches scores with live data from `yahooquery`, and blends in news sentiment from the `NewsAnalysisAgent` database.
 
-It uses a **GARP + Momentum** (Growth At a Reasonable Price) hybrid scoring model.
+It produces **two separate scores per stock** — short-term and long-term — using a **GARP + Momentum + Sentiment** hybrid model.
+
+---
 
 ## 🧠 Scoring Methodology
 
-The agent computes a final score based on a weighted combination of four key metrics:
+Each stock receives three scores, all on a 0–100 scale:
 
-1. **Momentum (40%)**: Calculated using the 1-month percentage price change. High momentum indicates a strong current trend.
-2. **Value (20%)**: Calculated using the Trailing P/E Ratio. Lower P/E ratios yield higher scores (provided earnings are positive).
-3. **Liquidity (20%)**: Calculated using the 30-day Average Daily Volume (ADV). Ensures the stock is highly liquid and safe to trade.
-4. **Growth (20%)**: A baseline metric for future EPS/Revenue growth calculations based on the fundamental API data.
+### Short-Term Score (momentum & sentiment driven)
+| Metric | Weight | Source |
+|--------|--------|--------|
+| Momentum (1-month price change) | 40% | `stock_prices` DB |
+| Sentiment (news + sector) | 30% | `NewsAnalysisAgent` DB |
+| Value (P/E ratio) | 15% | yahooquery |
+| Liquidity (30-day ADV) | 15% | `stock_prices` DB |
 
-The final data is stored in the `garp_momentum_scores` PostgreSQL table.
+### Long-Term Score (fundamentals driven)
+| Metric | Weight | Source |
+|--------|--------|--------|
+| ROE (Return on Equity) | 25% | yahooquery |
+| Debt/Equity ratio | 20% | yahooquery → balance sheet fallback |
+| Revenue Growth | 20% | yahooquery |
+| Operating Cash Flow Growth | 20% | Fundamentals API (annual → quarterly → NetIncome YoY) |
+| Value (P/E ratio) | 15% | yahooquery |
+
+### Final Score
+```
+final_score = short_term_score × 0.5 + long_term_score × 0.5
+```
+
+All scores are stored in the `garp_momentum_scores` table.
+
+---
+
+## 🗄️ Database Architecture
+
+The agent connects to **two separate PostgreSQL databases**:
+
+| Variable Prefix | Database | Tables Used |
+|-----------------|----------|-------------|
+| `POSTGRES_*` | Stock data DB | `stock_prices`, `garp_momentum_scores` |
+| `NEWS_POSTGRES_DB` | News/Sentiment DB | `news_analysis`, `yf_news` |
+
+Both databases share the same host, user, and password — only the DB name differs.
+
+---
 
 ## ⚙️ Configuration
 
-Create a `.env` file in the root directory (never commit this to git). It requires the following variables:
+Create a `.env` file in the root directory (never commit this to git):
 
 ```env
-# Database Configuration
+# Stock Price / Scoring DB
 POSTGRES_HOST=your_server_ip
 POSTGRES_DB=stockdata
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your_secure_password
 
-# StockmarketDataCollector API Endpoint
+# News / Sentiment DB (same host/user/password, different DB name)
+NEWS_POSTGRES_DB=newsdb
+
+# StockmarketDataCollector API
 API_BASE_URL=http://your_server_ip:8001/fundamentals
 ```
 
+---
+
 ## 📡 API Endpoints
 
-The agent runs a FastAPI server on port `8002` to allow you to monitor and control it.
+The agent runs a FastAPI server on port `8002`.
 
-*   `GET /status`: Returns the agent's current status and the exact timestamp of the last successful sorting run.
-*   `POST /trigger`: Manually forces the sorting agent to run immediately in the background.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/status` | Returns agent status and last run timestamp |
+| `POST` | `/trigger` | Manually triggers a scoring run in the background |
+
+---
 
 ## 🚀 Running Locally
 
-Ensure your `StockmarketDataCollector` API is running on port 8001, as the Sorting Agent relies on it to fetch fundamentals.
+Ensure your `StockmarketDataCollector` API is running on port `8001`.
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the agent (starts the scheduler)
+# Run pre-deploy validation (recommended)
+python preflight_check.py AARTIIND.NS
+
+# Run the agent (starts the scheduler + API server)
 python main.py
 ```
 
-*Note: The agent is programmed using APScheduler to run automatically at **9:00 PM IST on Weekdays**.*
+> The agent automatically runs at **9:00 PM IST on Weekdays** via APScheduler.
+
+---
+
+## 🔍 Diagnostic Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `preflight_check.py [SYMBOL]` | Full pre-deploy validation — tests DB connections, all API endpoints, yahooquery, and data completeness |
+| `diagnose_yq.py [SYMBOL]` | Inspects raw yahooquery values (PE, ROE, D/E, Revenue Growth) vs computed scores for a single symbol |
+
+---
 
 ## ☁️ Deployment (CI/CD)
 
-This repository includes a fully automated CI/CD pipeline using GitHub Actions and Docker.
-1. Push your code to the `main` branch.
-2. The `.github/workflows/deploy.yml` action will trigger.
-3. The VM will pull the code, dynamically inject the `.env` file using GitHub Secrets, and spin up the agent via `docker-compose`.
+Push to `main` to trigger the automated GitHub Actions pipeline:
+1. SSH into the VM
+2. Injects `.env` from GitHub Secrets
+3. Pulls latest code
+4. Rebuilds Docker image and restarts the container
 
 **Required GitHub Secrets:**
-- `SERVER_IP`, `SERVER_SSH`, `SERVER_USER`
-- `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
-- `API_BASE_URL`
+
+| Secret | Description |
+|--------|-------------|
+| `SERVER_IP` | VM IP address |
+| `SERVER_SSH` | SSH private key |
+| `SERVER_USER` | SSH username |
+| `POSTGRES_HOST` | Stock DB host |
+| `POSTGRES_DB` | Stock DB name |
+| `POSTGRES_USER` | DB user |
+| `POSTGRES_PASSWORD` | DB password |
+| `NEWS_POSTGRES_DB` | News/Sentiment DB name |
+| `API_BASE_URL` | Fundamentals API base URL |
