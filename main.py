@@ -61,29 +61,33 @@ def calculate_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+API_TIMEOUT = 10  # seconds per fundamentals request
+
 def fetch_fundamentals_from_api(ticker):
     """Call the existing API to get fundamentals."""
     print(f"[{ticker}] Fetching fundamentals from API...")
     fundamentals = {}
     try:
-        bs_req = requests.get(f"{API_BASE_URL}/{ticker}/balancesheet/annual")
-        cf_req = requests.get(f"{API_BASE_URL}/{ticker}/cashflow/annual")
-        prof_req = requests.get(f"{API_BASE_URL}/{ticker}/profile")
-        
-        fundamentals['balance_sheet'] = bs_req.json() if bs_req.status_code == 200 else {}
-        fundamentals['cash_flow'] = cf_req.json() if cf_req.status_code == 200 else {}
-        fundamentals['profile'] = prof_req.json() if prof_req.status_code == 200 else {}
+        bs_req   = requests.get(f"{API_BASE_URL}/{ticker}/balancesheet/annual", timeout=API_TIMEOUT)
+        cf_req   = requests.get(f"{API_BASE_URL}/{ticker}/cashflow/annual",     timeout=API_TIMEOUT)
+        prof_req = requests.get(f"{API_BASE_URL}/{ticker}/profile",             timeout=API_TIMEOUT)
+
+        fundamentals['balance_sheet'] = bs_req.json()   if bs_req.status_code   == 200 else {}
+        fundamentals['cash_flow']     = cf_req.json()   if cf_req.status_code   == 200 else {}
+        fundamentals['profile']       = prof_req.json() if prof_req.status_code == 200 else {}
+    except requests.exceptions.Timeout:
+        print(f"[{ticker}] API request timed out after {API_TIMEOUT}s — fundamentals skipped")
     except requests.exceptions.RequestException as e:
         print(f"[{ticker}] API request failed: {e}")
     return fundamentals
 
-def process_symbol(symbol, conn):
+def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connection
     print(f"[{symbol}] Processing...")
     
     fundamentals = fetch_fundamentals_from_api(symbol)
     
     query = """
-        SELECT timestamp, close, volume 
+        SELECT timestamp, COALESCE(close, adj_close) AS close, volume 
         FROM stock_prices 
         WHERE symbol = %s AND interval = '1d'
         ORDER BY timestamp ASC
@@ -107,25 +111,63 @@ def process_symbol(symbol, conn):
     else:
         momentum_pct = 0
         
-    profile = fundamentals.get('profile', {})
-    if isinstance(profile, dict):
-        pe_ratio = profile.get('trailingPE', 0)
-    else:
+    # --- P/E Ratio extraction ---
+    # The collector's /profile endpoint returns yahooquery asset_profile which only has
+    # company info (sector, country, etc.) — NOT valuation metrics.
+    # trailingPe lives in yahooquery summary_detail, so we fetch it directly.
+    pe_ratio = 0
+    try:
+        from yahooquery import Ticker as YQTicker
+        yq = YQTicker(symbol)
+        sd = yq.summary_detail
+        if isinstance(sd, dict) and symbol in sd:
+            raw_pe = sd[symbol].get('trailingPE') or sd[symbol].get('trailingPe')
+            pe_ratio = float(raw_pe) if raw_pe is not None else 0
+    except Exception as e:
+        print(f"[{symbol}] Could not fetch trailingPe from yahooquery: {e}")
         pe_ratio = 0
-        
-    if pe_ratio is None: pe_ratio = 0
-    
-    momentum_score = min(max((momentum_pct + 20) * 2.5, 0), 100) 
-    liquidity_score = min((adv / 20000), 100) 
-    
+
+    # --- Cash flow / Growth score ---
+    # /cashflow/annual returns yahooquery cash_flow() records.
+    # yahooquery uses PascalCase: 'OperatingCashFlow' (not 'operatingCashflow').
+    cash_flow = fundamentals.get('cash_flow', {})
+    cf_records = cash_flow if isinstance(cash_flow, list) else ([cash_flow] if isinstance(cash_flow, dict) else [])
+    ocf_values = []
+    for rec in cf_records:
+        if isinstance(rec, dict):
+            # yahooquery PascalCase first, then camelCase fallbacks
+            ocf = (rec.get('OperatingCashFlow')
+                   or rec.get('operatingCashflow')
+                   or rec.get('totalCashFromOperatingActivities'))
+            if ocf is not None:
+                try:
+                    ocf_values.append(float(ocf))
+                except (TypeError, ValueError):
+                    pass
+    if len(ocf_values) >= 2:
+        # ocf_values[0] = most recent year, ocf_values[1] = prior year
+        prior = ocf_values[1]
+        if prior != 0:
+            ocf_growth_pct = ((ocf_values[0] - prior) / abs(prior)) * 100
+            # Map -50% → 0, 0% → 50, +50% → 100
+            growth_score = min(max(ocf_growth_pct + 50, 0), 100)
+        else:
+            growth_score = 50
+    else:
+        print(f"[{symbol}] No cash-flow growth data available; defaulting growth_score=50")
+        growth_score = 50
+
+    momentum_score = min(max((momentum_pct + 20) * 2.5, 0), 100)
+    liquidity_score = min((adv / 20000), 100)
+
     if 0 < pe_ratio < 15:
         value_score = 100
     elif 15 <= pe_ratio < 30:
         value_score = 100 - ((pe_ratio - 15) * 3.33)
     else:
         value_score = 20
-        
-    growth_score = 50 
+        if pe_ratio == 0:
+            print(f"[{symbol}] pe_ratio is 0 (missing data) — value_score defaulting to 20")
     final_score = (momentum_score * 0.4) + (value_score * 0.2) + (growth_score * 0.2) + (liquidity_score * 0.2)
     
     print(f"[{symbol}] Scores -> Final: {final_score:.2f} | M: {momentum_score:.1f} | V: {value_score:.1f} | L: {liquidity_score:.1f}")
@@ -157,29 +199,55 @@ def run_agent():
     if is_running:
         print("Sorting run already in progress.")
         return
-        
+
     is_running = True
     print(f"Starting scheduled SortingAgent run at {datetime.now()}...")
-    conn = get_db_connection()
-    
+
+    # Use a dedicated connection ONLY for fetching the symbol list so that
+    # per-symbol connections opened inside process_symbol don't share cursors.
+    list_conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT symbol FROM stock_prices")
+        with list_conn.cursor() as cur:
+            cur.execute("""
+                SELECT symbol
+                FROM (
+                    SELECT symbol, COUNT(*) AS row_count
+                    FROM stock_prices
+                    WHERE interval = '1d'
+                    GROUP BY symbol
+                ) sub
+                WHERE row_count >= 50
+                ORDER BY symbol
+            """)
             symbols = [row[0] for row in cur.fetchall()]
-            
-        print(f"Found {len(symbols)} symbols to process.")
-        
+    finally:
+        list_conn.close()
+
+    print(f"Found {len(symbols)} symbols with >= 50 daily rows to process.")
+
+    try:
         for symbol in symbols:
-            process_symbol(symbol, conn)
-            time.sleep(5) # 5 second delay to strictly rate limit API and DB calls
-            
+            # Open a fresh, independent connection for every symbol to avoid
+            # cursor conflicts between the list query and per-symbol reads.
+            sym_conn = get_db_connection()
+            try:
+                process_symbol(symbol, sym_conn)
+            except Exception as e:
+                print(f"[{symbol}] Error during processing: {e}")
+                try:
+                    sym_conn.rollback()
+                except Exception:
+                    pass
+            finally:
+                sym_conn.close()
+            time.sleep(5)  # rate-limit API + DB calls
+
         print("Scoring run complete!")
         last_run_time = datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
     except Exception as e:
         print(f"Error during agent run: {e}")
     finally:
         is_running = False
-        conn.close()
 
 @app.get("/status")
 def get_status():
