@@ -42,12 +42,24 @@ def setup_database():
                     value_score REAL,
                     growth_score REAL,
                     liquidity_score REAL,
+                    sentiment_score REAL,
+                    roe_score REAL,
+                    debt_score REAL,
+                    revenue_score REAL,
                     final_score REAL,
+                    short_term_score REAL,
+                    long_term_score REAL,
                     rsi_14 REAL,
                     adv_30 BIGINT,
                     pe_ratio REAL,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
-                )
+                );
+                ALTER TABLE garp_momentum_scores ADD COLUMN IF NOT EXISTS sentiment_score REAL;
+                ALTER TABLE garp_momentum_scores ADD COLUMN IF NOT EXISTS roe_score REAL;
+                ALTER TABLE garp_momentum_scores ADD COLUMN IF NOT EXISTS debt_score REAL;
+                ALTER TABLE garp_momentum_scores ADD COLUMN IF NOT EXISTS revenue_score REAL;
+                ALTER TABLE garp_momentum_scores ADD COLUMN IF NOT EXISTS short_term_score REAL;
+                ALTER TABLE garp_momentum_scores ADD COLUMN IF NOT EXISTS long_term_score REAL;
             """)
             conn.commit()
     finally:
@@ -62,6 +74,55 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 API_TIMEOUT = 10  # seconds per fundamentals request
+
+
+def fetch_sentiment_score(symbol: str, conn) -> float:
+    """
+    Phase 1: Query the last 7 days of news_analysis for this symbol.
+    Matches on impact_entity (Company-level) OR yf_news symbol column.
+    Returns a score 0-100: 50 = neutral, >50 positive, <50 negative.
+    """
+    try:
+        with conn.cursor() as cur:
+            # Company-level sentiment from NewsAnalysisAgent
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END) AS pos,
+                    SUM(CASE WHEN na.sentiment = 'Negative' THEN 1 ELSE 0 END) AS neg,
+                    COUNT(*) AS total
+                FROM news_analysis na
+                WHERE na.impact_level = 'Company'
+                  AND UPPER(na.impact_entity) = UPPER(%s)
+                  AND na.created_at > NOW() - INTERVAL '7 days'
+            """, (symbol,))
+            row = cur.fetchone()
+            pos, neg, total = (row[0] or 0), (row[1] or 0), (row[2] or 0)
+
+            # Also check yf_news sentiment via joined analysis
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END) AS pos,
+                    SUM(CASE WHEN na.sentiment = 'Negative' THEN 1 ELSE 0 END) AS neg,
+                    COUNT(*) AS total
+                FROM yf_news yf
+                JOIN news_analysis na ON yf.id = na.article_id AND na.article_source = 'yf'
+                WHERE UPPER(yf.symbol) = UPPER(%s)
+                  AND yf.fetched_at > NOW() - INTERVAL '7 days'
+            """, (symbol,))
+            row2 = cur.fetchone()
+            pos  += (row2[0] or 0)
+            neg  += (row2[1] or 0)
+            total += (row2[2] or 0)
+
+        if total == 0:
+            return 50.0  # neutral when no data
+        # Normalise: 100% positive → 100, 100% negative → 0
+        score = ((pos - neg) / total) * 50 + 50
+        return round(min(max(score, 0), 100), 2)
+    except Exception as e:
+        print(f"[{symbol}] Sentiment query failed: {e}")
+        return 50.0
+
 
 def fetch_fundamentals_from_api(ticker):
     """Call the existing API to get fundamentals."""
@@ -127,15 +188,62 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
         print(f"[{symbol}] Could not fetch trailingPe from yahooquery: {e}")
         pe_ratio = 0
 
-    # --- Cash flow / Growth score ---
-    # /cashflow/annual returns yahooquery cash_flow() records.
-    # yahooquery uses PascalCase: 'OperatingCashFlow' (not 'operatingCashflow').
+    # ── Phase 1: Sentiment score ───────────────────────────────────────────────
+    sentiment_score = fetch_sentiment_score(symbol, conn)
+
+    # ── Phase 2: Additional fundamentals (ROE, Debt/Equity, Revenue Growth) ──
+    balance_sheet = fundamentals.get('balance_sheet', {})
+    bs_records = balance_sheet if isinstance(balance_sheet, list) else ([balance_sheet] if isinstance(balance_sheet, dict) else [])
+
+    # --- ROE score (Return on Equity) ---
+    roe_score = 50.0
+    try:
+        from yahooquery import Ticker as YQTicker2
+        yq2 = YQTicker2(symbol)
+        fs = yq2.financial_data
+        if isinstance(fs, dict) and symbol in fs:
+            roe_raw = fs[symbol].get('returnOnEquity')  # yahooquery returns as decimal e.g. 0.22
+            if roe_raw is not None:
+                roe_pct = float(roe_raw) * 100
+                # 0% ROE → 0, 15% → 50, 30%+ → 100
+                roe_score = min(max((roe_pct / 30) * 100, 0), 100)
+    except Exception as e:
+        print(f"[{symbol}] ROE fetch failed: {e}")
+
+    # --- Debt/Equity score (lower D/E is better) ---
+    debt_score = 50.0
+    try:
+        yq3 = YQTicker2(symbol)
+        ks = yq3.key_stats
+        if isinstance(ks, dict) and symbol in ks:
+            de_raw = ks[symbol].get('debtToEquity')  # expressed as percentage e.g. 45.2 means 0.452
+            if de_raw is not None:
+                de = float(de_raw) / 100  # normalise to ratio
+                # D/E 0 → 100, 0.5 → 75, 1.0 → 50, 2.0+ → 0
+                debt_score = min(max(100 - (de * 50), 0), 100)
+    except Exception as e:
+        print(f"[{symbol}] D/E fetch failed: {e}")
+
+    # --- Revenue Growth score ---
+    revenue_score = 50.0
+    try:
+        yq4 = YQTicker2(symbol)
+        fd = yq4.financial_data
+        if isinstance(fd, dict) and symbol in fd:
+            rev_growth_raw = fd[symbol].get('revenueGrowth')  # decimal e.g. 0.12 = 12%
+            if rev_growth_raw is not None:
+                rev_growth_pct = float(rev_growth_raw) * 100
+                # -20% → 0, 0% → 50, +20%+ → 100
+                revenue_score = min(max((rev_growth_pct + 20) * 2.5, 0), 100)
+    except Exception as e:
+        print(f"[{symbol}] Revenue growth fetch failed: {e}")
+
+    # --- Operating Cash Flow Growth (existing logic) ---
     cash_flow = fundamentals.get('cash_flow', {})
     cf_records = cash_flow if isinstance(cash_flow, list) else ([cash_flow] if isinstance(cash_flow, dict) else [])
     ocf_values = []
     for rec in cf_records:
         if isinstance(rec, dict):
-            # yahooquery PascalCase first, then camelCase fallbacks
             ocf = (rec.get('OperatingCashFlow')
                    or rec.get('operatingCashflow')
                    or rec.get('totalCashFromOperatingActivities'))
@@ -145,16 +253,14 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
                 except (TypeError, ValueError):
                     pass
     if len(ocf_values) >= 2:
-        # ocf_values[0] = most recent year, ocf_values[1] = prior year
         prior = ocf_values[1]
         if prior != 0:
             ocf_growth_pct = ((ocf_values[0] - prior) / abs(prior)) * 100
-            # Map -50% → 0, 0% → 50, +50% → 100
             growth_score = min(max(ocf_growth_pct + 50, 0), 100)
         else:
             growth_score = 50
     else:
-        print(f"[{symbol}] No cash-flow growth data available; defaulting growth_score=50")
+        print(f"[{symbol}] No cash-flow growth data; defaulting growth_score=50")
         growth_score = 50
 
     momentum_score = min(max((momentum_pct + 20) * 2.5, 0), 100)
@@ -167,30 +273,64 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
     else:
         value_score = 20
         if pe_ratio == 0:
-            print(f"[{symbol}] pe_ratio is 0 (missing data) — value_score defaulting to 20")
-    final_score = (momentum_score * 0.4) + (value_score * 0.2) + (growth_score * 0.2) + (liquidity_score * 0.2)
-    
-    print(f"[{symbol}] Scores -> Final: {final_score:.2f} | M: {momentum_score:.1f} | V: {value_score:.1f} | L: {liquidity_score:.1f}")
+            print(f"[{symbol}] pe_ratio is 0 — value_score defaulting to 20")
+
+    # ── Phase 3: Split into short-term and long-term scores ───────────────────
+    # Short-term: momentum & sentiment driven (what can earn soon)
+    short_term_score = (
+        momentum_score   * 0.40 +
+        sentiment_score  * 0.30 +
+        value_score      * 0.15 +
+        liquidity_score  * 0.15
+    )
+    # Long-term: fundamentals driven (what is worth holding)
+    long_term_score = (
+        roe_score        * 0.25 +
+        debt_score       * 0.20 +
+        revenue_score    * 0.20 +
+        growth_score     * 0.20 +
+        value_score      * 0.15
+    )
+    # Blended final score
+    final_score = (short_term_score * 0.5) + (long_term_score * 0.5)
+
+    print(
+        f"[{symbol}] ST: {short_term_score:.1f} | LT: {long_term_score:.1f} | Final: {final_score:.1f} "
+        f"| M:{momentum_score:.0f} V:{value_score:.0f} G:{growth_score:.0f} "
+        f"| Sent:{sentiment_score:.0f} ROE:{roe_score:.0f} D/E:{debt_score:.0f} Rev:{revenue_score:.0f}"
+    )
     
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO garp_momentum_scores 
-                (symbol, momentum_score, value_score, growth_score, liquidity_score, final_score, rsi_14, adv_30, pe_ratio, updated_at)
-            VALUES 
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            INSERT INTO garp_momentum_scores
+                (symbol, momentum_score, value_score, growth_score, liquidity_score,
+                 sentiment_score, roe_score, debt_score, revenue_score,
+                 final_score, short_term_score, long_term_score,
+                 rsi_14, adv_30, pe_ratio, updated_at)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (symbol) DO UPDATE SET
-                momentum_score = EXCLUDED.momentum_score,
-                value_score = EXCLUDED.value_score,
-                growth_score = EXCLUDED.growth_score,
-                liquidity_score = EXCLUDED.liquidity_score,
-                final_score = EXCLUDED.final_score,
-                rsi_14 = EXCLUDED.rsi_14,
-                adv_30 = EXCLUDED.adv_30,
-                pe_ratio = EXCLUDED.pe_ratio,
-                updated_at = NOW();
+                momentum_score   = EXCLUDED.momentum_score,
+                value_score      = EXCLUDED.value_score,
+                growth_score     = EXCLUDED.growth_score,
+                liquidity_score  = EXCLUDED.liquidity_score,
+                sentiment_score  = EXCLUDED.sentiment_score,
+                roe_score        = EXCLUDED.roe_score,
+                debt_score       = EXCLUDED.debt_score,
+                revenue_score    = EXCLUDED.revenue_score,
+                final_score      = EXCLUDED.final_score,
+                short_term_score = EXCLUDED.short_term_score,
+                long_term_score  = EXCLUDED.long_term_score,
+                rsi_14           = EXCLUDED.rsi_14,
+                adv_30           = EXCLUDED.adv_30,
+                pe_ratio         = EXCLUDED.pe_ratio,
+                updated_at       = NOW();
         """, (
-            symbol, float(momentum_score), float(value_score), float(growth_score), float(liquidity_score), 
-            float(final_score), float(rsi), adv, float(pe_ratio)
+            symbol,
+            float(momentum_score), float(value_score), float(growth_score), float(liquidity_score),
+            float(sentiment_score), float(roe_score), float(debt_score), float(revenue_score),
+            float(final_score), float(short_term_score), float(long_term_score),
+            float(rsi), adv, float(pe_ratio)
         ))
     conn.commit()
 
