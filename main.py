@@ -14,6 +14,15 @@ import uvicorn
 
 load_dotenv()
 
+# --- yahooquery: optional dependency for PE/ROE/D-E/Revenue metrics ---
+try:
+    from yahooquery import Ticker as YQTicker
+    YAHOOQUERY_AVAILABLE = True
+except ImportError:
+    YQTicker = None
+    YAHOOQUERY_AVAILABLE = False
+    print("[WARNING] yahooquery not installed — PE/ROE/D-E/Revenue metrics will default to neutral values.")
+
 API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8001/fundamentals")
 
 app = FastAPI(title="Sorting Agent API")
@@ -21,10 +30,21 @@ last_run_time = None
 is_running = False
 
 def get_db_connection():
+    """Stock price / scoring database (POSTGRES_* vars)."""
     return psycopg2.connect(
         host=os.environ.get("POSTGRES_HOST", "localhost"),
         port=os.environ.get("POSTGRES_PORT", "5432"),
         dbname=os.environ.get("POSTGRES_DB", "postgres"),
+        user=os.environ.get("POSTGRES_USER", "postgres"),
+        password=os.environ.get("POSTGRES_PASSWORD", "")
+    )
+
+def get_news_db_connection():
+    """News / sentiment database — same host/user/password as stock DB, different DB name."""
+    return psycopg2.connect(
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=os.environ.get("POSTGRES_PORT", "5432"),
+        dbname=os.environ.get("NEWS_POSTGRES_DB", "newsdata"),
         user=os.environ.get("POSTGRES_USER", "postgres"),
         password=os.environ.get("POSTGRES_PASSWORD", "")
     )
@@ -76,7 +96,7 @@ def calculate_rsi(series, period=14):
 API_TIMEOUT = 10  # seconds per fundamentals request
 
 
-def fetch_sentiment_score(symbol: str, company_name: str, sector: str, conn) -> float:
+def fetch_sentiment_score(symbol: str, company_name: str, sector: str, news_conn) -> float:
     """
     Query last 7 days of news_analysis. Three sources, weighted by specificity:
       Query 1 (company RSS)  — impact_level='Company', matched by company_name  → weight 60%
@@ -91,7 +111,7 @@ def fetch_sentiment_score(symbol: str, company_name: str, sector: str, conn) -> 
         return round(min(max(((pos - neg) / total) * 50 + 50, 0), 100), 2)
 
     try:
-        with conn.cursor() as cur:
+        with news_conn.cursor() as cur:
             # Query 1: RSS news matched by company name
             cur.execute("""
                 SELECT
@@ -156,6 +176,11 @@ def fetch_sentiment_score(symbol: str, company_name: str, sector: str, conn) -> 
         return round(final, 2)
     except Exception as e:
         print(f"[{symbol}] Sentiment query failed: {e}")
+        # Roll back so the connection is clean for the subsequent INSERT
+        try:
+            news_conn.rollback()
+        except Exception:
+            pass
         return 50.0
 
 
@@ -223,19 +248,26 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
     # company info (sector, country, etc.) — NOT valuation metrics.
     # trailingPe lives in yahooquery summary_detail, so we fetch it directly.
     pe_ratio = 0
-    try:
-        from yahooquery import Ticker as YQTicker
-        yq = YQTicker(symbol)
-        sd = yq.summary_detail
-        if isinstance(sd, dict) and symbol in sd:
-            raw_pe = sd[symbol].get('trailingPE') or sd[symbol].get('trailingPe')
-            pe_ratio = float(raw_pe) if raw_pe is not None else 0
-    except Exception as e:
-        print(f"[{symbol}] Could not fetch trailingPe from yahooquery: {e}")
-        pe_ratio = 0
+    if YAHOOQUERY_AVAILABLE:
+        try:
+            yq = YQTicker(symbol)
+            sd = yq.summary_detail
+            if isinstance(sd, dict) and symbol in sd:
+                raw_pe = sd[symbol].get('trailingPE') or sd[symbol].get('trailingPe')
+                pe_ratio = float(raw_pe) if raw_pe is not None else 0
+        except Exception as e:
+            print(f"[{symbol}] Could not fetch trailingPe from yahooquery: {e}")
+            pe_ratio = 0
+    else:
+        print(f"[{symbol}] yahooquery unavailable — pe_ratio defaulting to 0")
 
     # ── Phase 1: Sentiment score (company + sector) ───────────────────────────
-    sentiment_score = fetch_sentiment_score(symbol, company_name, sector, conn)
+    # Uses a dedicated connection to the NewsAnalysisAgent DB (NEWS_POSTGRES_*)
+    news_conn = get_news_db_connection()
+    try:
+        sentiment_score = fetch_sentiment_score(symbol, company_name, sector, news_conn)
+    finally:
+        news_conn.close()
 
     # ── Phase 2: Additional fundamentals (ROE, Debt/Equity, Revenue Growth) ──
     balance_sheet = fundamentals.get('balance_sheet', {})
@@ -243,46 +275,48 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
 
     # --- ROE score (Return on Equity) ---
     roe_score = 50.0
-    try:
-        from yahooquery import Ticker as YQTicker2
-        yq2 = YQTicker2(symbol)
-        fs = yq2.financial_data
-        if isinstance(fs, dict) and symbol in fs:
-            roe_raw = fs[symbol].get('returnOnEquity')  # yahooquery returns as decimal e.g. 0.22
-            if roe_raw is not None:
-                roe_pct = float(roe_raw) * 100
-                # 0% ROE → 0, 15% → 50, 30%+ → 100
-                roe_score = min(max((roe_pct / 30) * 100, 0), 100)
-    except Exception as e:
-        print(f"[{symbol}] ROE fetch failed: {e}")
+    if YAHOOQUERY_AVAILABLE:
+        try:
+            yq2 = YQTicker(symbol)
+            fs = yq2.financial_data
+            if isinstance(fs, dict) and symbol in fs:
+                roe_raw = fs[symbol].get('returnOnEquity')  # yahooquery returns as decimal e.g. 0.22
+                if roe_raw is not None:
+                    roe_pct = float(roe_raw) * 100
+                    # 0% ROE → 0, 15% → 50, 30%+ → 100
+                    roe_score = min(max((roe_pct / 30) * 100, 0), 100)
+        except Exception as e:
+            print(f"[{symbol}] ROE fetch failed: {e}")
 
     # --- Debt/Equity score (lower D/E is better) ---
     debt_score = 50.0
-    try:
-        yq3 = YQTicker2(symbol)
-        ks = yq3.key_stats
-        if isinstance(ks, dict) and symbol in ks:
-            de_raw = ks[symbol].get('debtToEquity')  # expressed as percentage e.g. 45.2 means 0.452
-            if de_raw is not None:
-                de = float(de_raw) / 100  # normalise to ratio
-                # D/E 0 → 100, 0.5 → 75, 1.0 → 50, 2.0+ → 0
-                debt_score = min(max(100 - (de * 50), 0), 100)
-    except Exception as e:
-        print(f"[{symbol}] D/E fetch failed: {e}")
+    if YAHOOQUERY_AVAILABLE:
+        try:
+            yq3 = YQTicker(symbol)
+            ks = yq3.key_stats
+            if isinstance(ks, dict) and symbol in ks:
+                de_raw = ks[symbol].get('debtToEquity')  # expressed as percentage e.g. 45.2 means 0.452
+                if de_raw is not None:
+                    de = float(de_raw) / 100  # normalise to ratio
+                    # D/E 0 → 100, 0.5 → 75, 1.0 → 50, 2.0+ → 0
+                    debt_score = min(max(100 - (de * 50), 0), 100)
+        except Exception as e:
+            print(f"[{symbol}] D/E fetch failed: {e}")
 
     # --- Revenue Growth score ---
     revenue_score = 50.0
-    try:
-        yq4 = YQTicker2(symbol)
-        fd = yq4.financial_data
-        if isinstance(fd, dict) and symbol in fd:
-            rev_growth_raw = fd[symbol].get('revenueGrowth')  # decimal e.g. 0.12 = 12%
-            if rev_growth_raw is not None:
-                rev_growth_pct = float(rev_growth_raw) * 100
-                # -20% → 0, 0% → 50, +20%+ → 100
-                revenue_score = min(max((rev_growth_pct + 20) * 2.5, 0), 100)
-    except Exception as e:
-        print(f"[{symbol}] Revenue growth fetch failed: {e}")
+    if YAHOOQUERY_AVAILABLE:
+        try:
+            yq4 = YQTicker(symbol)
+            fd = yq4.financial_data
+            if isinstance(fd, dict) and symbol in fd:
+                rev_growth_raw = fd[symbol].get('revenueGrowth')  # decimal e.g. 0.12 = 12%
+                if rev_growth_raw is not None:
+                    rev_growth_pct = float(rev_growth_raw) * 100
+                    # -20% → 0, 0% → 50, +20%+ → 100
+                    revenue_score = min(max((rev_growth_pct + 20) * 2.5, 0), 100)
+        except Exception as e:
+            print(f"[{symbol}] Revenue growth fetch failed: {e}")
 
     # --- Operating Cash Flow Growth (existing logic) ---
     cash_flow = fundamentals.get('cash_flow', {})

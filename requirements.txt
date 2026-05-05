@@ -2,9 +2,8 @@ pandas
 requests
 psycopg2-binary
 python-dotenv
-
 apscheduler
 pytz
-
 fastapi
 uvicorn
+yahooquery

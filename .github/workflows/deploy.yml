@@ -40,6 +40,7 @@ jobs:
             echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}" >> "$APP_DIR/.env"
             echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}" >> "$APP_DIR/.env"
             echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" >> "$APP_DIR/.env"
+            echo "NEWS_POSTGRES_DB=${{ secrets.NEWS_POSTGRES_DB }}" >> "$APP_DIR/.env"
             echo "API_BASE_URL=${{ secrets.API_BASE_URL }}" >> "$APP_DIR/.env"
 
             # Sync Code
