@@ -76,15 +76,17 @@ def calculate_rsi(series, period=14):
 API_TIMEOUT = 10  # seconds per fundamentals request
 
 
-def fetch_sentiment_score(symbol: str, conn) -> float:
+def fetch_sentiment_score(symbol: str, company_name: str, conn) -> float:
     """
     Phase 1: Query the last 7 days of news_analysis for this symbol.
-    Matches on impact_entity (Company-level) OR yf_news symbol column.
+    - Query 1: Matches on impact_entity using company_name (e.g. 'Reliance Industries')
+               so the comparison against LLM-extracted entity names is accurate.
+    - Query 2: Matches on yf_news.symbol (exact ticker) — always precise.
     Returns a score 0-100: 50 = neutral, >50 positive, <50 negative.
     """
     try:
         with conn.cursor() as cur:
-            # Company-level sentiment from NewsAnalysisAgent
+            # Query 1: RSS news — match company name against LLM-extracted impact_entity
             cur.execute("""
                 SELECT
                     SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END) AS pos,
@@ -94,11 +96,11 @@ def fetch_sentiment_score(symbol: str, conn) -> float:
                 WHERE na.impact_level = 'Company'
                   AND UPPER(na.impact_entity) = UPPER(%s)
                   AND na.created_at > NOW() - INTERVAL '7 days'
-            """, (symbol,))
+            """, (company_name,))
             row = cur.fetchone()
             pos, neg, total = (row[0] or 0), (row[1] or 0), (row[2] or 0)
 
-            # Also check yf_news sentiment via joined analysis
+            # Query 2: yfinance news — match exact ticker symbol (always correct)
             cur.execute("""
                 SELECT
                     SUM(CASE WHEN na.sentiment = 'Positive' THEN 1 ELSE 0 END) AS pos,
@@ -110,13 +112,12 @@ def fetch_sentiment_score(symbol: str, conn) -> float:
                   AND yf.fetched_at > NOW() - INTERVAL '7 days'
             """, (symbol,))
             row2 = cur.fetchone()
-            pos  += (row2[0] or 0)
-            neg  += (row2[1] or 0)
+            pos   += (row2[0] or 0)
+            neg   += (row2[1] or 0)
             total += (row2[2] or 0)
 
         if total == 0:
             return 50.0  # neutral when no data
-        # Normalise: 100% positive → 100, 100% negative → 0
         score = ((pos - neg) / total) * 50 + 50
         return round(min(max(score, 0), 100), 2)
     except Exception as e:
@@ -144,8 +145,18 @@ def fetch_fundamentals_from_api(ticker):
 
 def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connection
     print(f"[{symbol}] Processing...")
-    
+
     fundamentals = fetch_fundamentals_from_api(symbol)
+
+    # Extract company name from profile for accurate RSS sentiment matching.
+    # The LLM tags news with company names (e.g. 'Reliance Industries'), not tickers.
+    profile = fundamentals.get('profile', {})
+    company_name = (
+        profile.get('longName')
+        or profile.get('shortName')
+        or symbol  # last resort fallback to ticker
+    )
+    print(f"[{symbol}] Company name resolved to: '{company_name}'")
     
     query = """
         SELECT timestamp, COALESCE(close, adj_close) AS close, volume 
@@ -189,7 +200,7 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
         pe_ratio = 0
 
     # ── Phase 1: Sentiment score ───────────────────────────────────────────────
-    sentiment_score = fetch_sentiment_score(symbol, conn)
+    sentiment_score = fetch_sentiment_score(symbol, company_name, conn)
 
     # ── Phase 2: Additional fundamentals (ROE, Debt/Equity, Revenue Growth) ──
     balance_sheet = fundamentals.get('balance_sheet', {})
