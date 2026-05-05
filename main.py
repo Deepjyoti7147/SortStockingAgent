@@ -189,13 +189,21 @@ def fetch_fundamentals_from_api(ticker):
     print(f"[{ticker}] Fetching fundamentals from API...")
     fundamentals = {}
     try:
-        bs_req   = requests.get(f"{API_BASE_URL}/{ticker}/balancesheet/annual", timeout=API_TIMEOUT)
-        cf_req   = requests.get(f"{API_BASE_URL}/{ticker}/cashflow/annual",     timeout=API_TIMEOUT)
-        prof_req = requests.get(f"{API_BASE_URL}/{ticker}/profile",             timeout=API_TIMEOUT)
+        bs_req    = requests.get(f"{API_BASE_URL}/{ticker}/balancesheet/annual",  timeout=API_TIMEOUT)
+        cf_ann    = requests.get(f"{API_BASE_URL}/{ticker}/cashflow/annual",       timeout=API_TIMEOUT)
+        cf_qtr    = requests.get(f"{API_BASE_URL}/{ticker}/cashflow/quarterly",    timeout=API_TIMEOUT)
+        prof_req  = requests.get(f"{API_BASE_URL}/{ticker}/profile",               timeout=API_TIMEOUT)
 
-        fundamentals['balance_sheet'] = bs_req.json()   if bs_req.status_code   == 200 else {}
-        fundamentals['cash_flow']     = cf_req.json()   if cf_req.status_code   == 200 else {}
-        fundamentals['profile']       = prof_req.json() if prof_req.status_code == 200 else {}
+        def _to_list(resp):
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+
+        fundamentals['balance_sheet']      = _to_list(bs_req)
+        fundamentals['cash_flow_annual']   = _to_list(cf_ann)
+        fundamentals['cash_flow_quarterly']= _to_list(cf_qtr)
+        fundamentals['profile']            = prof_req.json() if prof_req.status_code == 200 else {}
     except requests.exceptions.Timeout:
         print(f"[{ticker}] API request timed out after {API_TIMEOUT}s — fundamentals skipped")
     except requests.exceptions.RequestException as e:
@@ -270,8 +278,9 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
         news_conn.close()
 
     # ── Phase 2: Additional fundamentals (ROE, Debt/Equity, Revenue Growth) ──
-    balance_sheet = fundamentals.get('balance_sheet', {})
-    bs_records = balance_sheet if isinstance(balance_sheet, list) else ([balance_sheet] if isinstance(balance_sheet, dict) else [])
+    bs_records  = fundamentals.get('balance_sheet', [])
+    cf_annual   = fundamentals.get('cash_flow_annual', [])
+    cf_quarterly= fundamentals.get('cash_flow_quarterly', [])
 
     # --- ROE score (Return on Equity) ---
     roe_score = 50.0
@@ -280,28 +289,45 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
             yq2 = YQTicker(symbol)
             fs = yq2.financial_data
             if isinstance(fs, dict) and symbol in fs:
-                roe_raw = fs[symbol].get('returnOnEquity')  # yahooquery returns as decimal e.g. 0.22
+                roe_raw = fs[symbol].get('returnOnEquity')  # decimal e.g. 0.22
                 if roe_raw is not None:
                     roe_pct = float(roe_raw) * 100
-                    # 0% ROE → 0, 15% → 50, 30%+ → 100
+                    # 0% ROE -> 0, 15% -> 50, 30%+ -> 100
                     roe_score = min(max((roe_pct / 30) * 100, 0), 100)
         except Exception as e:
             print(f"[{symbol}] ROE fetch failed: {e}")
 
     # --- Debt/Equity score (lower D/E is better) ---
+    # Primary: yahooquery key_stats.debtToEquity
+    # Fallback: compute from balance sheet TotalDebt / CommonStockEquity
     debt_score = 50.0
+    de_source  = None
     if YAHOOQUERY_AVAILABLE:
         try:
             yq3 = YQTicker(symbol)
             ks = yq3.key_stats
             if isinstance(ks, dict) and symbol in ks:
-                de_raw = ks[symbol].get('debtToEquity')  # expressed as percentage e.g. 45.2 means 0.452
+                de_raw = ks[symbol].get('debtToEquity')  # percentage e.g. 45.2 = 0.452 ratio
                 if de_raw is not None:
-                    de = float(de_raw) / 100  # normalise to ratio
-                    # D/E 0 → 100, 0.5 → 75, 1.0 → 50, 2.0+ → 0
+                    de = float(de_raw) / 100
                     debt_score = min(max(100 - (de * 50), 0), 100)
+                    de_source = f"yahooquery ({de:.3f})"
         except Exception as e:
-            print(f"[{symbol}] D/E fetch failed: {e}")
+            print(f"[{symbol}] D/E fetch (yahooquery) failed: {e}")
+
+    if de_source is None and bs_records:  # fallback: compute from API balance sheet
+        try:
+            latest_bs = max(bs_records, key=lambda r: r.get('asOfDate', ''))
+            total_debt = latest_bs.get('TotalDebt')
+            equity     = latest_bs.get('CommonStockEquity') or latest_bs.get('StockholdersEquity')
+            if total_debt is not None and equity and float(equity) > 0:
+                de = float(total_debt) / float(equity)
+                debt_score = min(max(100 - (de * 50), 0), 100)
+                de_source  = f"balance sheet ({de:.3f})"
+        except Exception as e:
+            print(f"[{symbol}] D/E fallback (balance sheet) failed: {e}")
+
+    print(f"[{symbol}] D/E source: {de_source or 'none — defaulting to 50'} | debt_score={debt_score:.1f}")
 
     # --- Revenue Growth score ---
     revenue_score = 50.0
@@ -313,35 +339,77 @@ def process_symbol(symbol, conn):  # conn is now a dedicated per-symbol connecti
                 rev_growth_raw = fd[symbol].get('revenueGrowth')  # decimal e.g. 0.12 = 12%
                 if rev_growth_raw is not None:
                     rev_growth_pct = float(rev_growth_raw) * 100
-                    # -20% → 0, 0% → 50, +20%+ → 100
+                    # -20% -> 0, 0% -> 50, +20%+ -> 100
                     revenue_score = min(max((rev_growth_pct + 20) * 2.5, 0), 100)
         except Exception as e:
             print(f"[{symbol}] Revenue growth fetch failed: {e}")
 
-    # --- Operating Cash Flow Growth (existing logic) ---
-    cash_flow = fundamentals.get('cash_flow', {})
-    cf_records = cash_flow if isinstance(cash_flow, list) else ([cash_flow] if isinstance(cash_flow, dict) else [])
-    ocf_values = []
-    for rec in cf_records:
-        if isinstance(rec, dict):
+    # --- Operating Cash Flow Growth ---
+    # Strategy:
+    #   1. Use annual records with real OCF (most reliable, sorted newest-first)
+    #   2. Fall back to quarterly OCF if annual has < 2 data points
+    #   3. Fall back to NetIncome YoY from quarterly records
+    def _extract_ocf(records):
+        """Return list of (asOfDate, ocf) sorted newest first, skipping nulls."""
+        result = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
             ocf = (rec.get('OperatingCashFlow')
                    or rec.get('operatingCashflow')
                    or rec.get('totalCashFromOperatingActivities'))
             if ocf is not None:
                 try:
-                    ocf_values.append(float(ocf))
+                    result.append((rec.get('asOfDate', ''), float(ocf)))
                 except (TypeError, ValueError):
                     pass
-    if len(ocf_values) >= 2:
-        prior = ocf_values[1]
-        if prior != 0:
-            ocf_growth_pct = ((ocf_values[0] - prior) / abs(prior)) * 100
-            growth_score = min(max(ocf_growth_pct + 50, 0), 100)
-        else:
-            growth_score = 50
+        return sorted(result, key=lambda x: x[0], reverse=True)
+
+    growth_score = 50
+    growth_source = None
+
+    # 1. Try annual OCF
+    annual_ocf = _extract_ocf(cf_annual)
+    if len(annual_ocf) >= 2:
+        latest_ocf, prior_ocf = annual_ocf[0][1], annual_ocf[1][1]
+        if prior_ocf != 0:
+            pct = ((latest_ocf - prior_ocf) / abs(prior_ocf)) * 100
+            growth_score = min(max(pct + 50, 0), 100)
+            growth_source = f"annual OCF YoY {pct:+.1f}%"
+
+    # 2. Try quarterly OCF
+    if growth_source is None:
+        qtr_ocf = _extract_ocf(cf_quarterly)
+        if len(qtr_ocf) >= 2:
+            latest_ocf, prior_ocf = qtr_ocf[0][1], qtr_ocf[1][1]
+            if prior_ocf != 0:
+                pct = ((latest_ocf - prior_ocf) / abs(prior_ocf)) * 100
+                growth_score = min(max(pct + 50, 0), 100)
+                growth_source = f"quarterly OCF QoQ {pct:+.1f}%"
+
+    # 3. Fall back to NetIncome YoY from quarterly records (same quarter, ~4 periods back)
+    if growth_source is None:
+        all_cf = cf_annual + cf_quarterly
+        ni_records = sorted(
+            [(r.get('asOfDate', ''), float(r['NetIncome']))
+             for r in all_cf
+             if isinstance(r, dict) and r.get('NetIncome') is not None],
+            key=lambda x: x[0]
+        )
+        if len(ni_records) >= 2:
+            latest_ni = ni_records[-1][1]
+            # YoY: compare to ~4 quarters ago; if fewer records, take oldest available
+            yoy_idx   = max(0, len(ni_records) - 5)
+            prior_ni  = ni_records[yoy_idx][1]
+            if prior_ni != 0:
+                pct = ((latest_ni - prior_ni) / abs(prior_ni)) * 100
+                growth_score = min(max(pct + 50, 0), 100)
+                growth_source = f"NetIncome YoY {pct:+.1f}%"
+
+    if growth_source:
+        print(f"[{symbol}] growth_score={growth_score:.1f} via {growth_source}")
     else:
-        print(f"[{symbol}] No cash-flow growth data; defaulting growth_score=50")
-        growth_score = 50
+        print(f"[{symbol}] No growth data available; defaulting growth_score=50")
 
     momentum_score = min(max((momentum_pct + 20) * 2.5, 0), 100)
     liquidity_score = min((adv / 20000), 100)
